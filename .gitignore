@@ -29,3 +29,14 @@ Thumbs.db
 # Plots / scratch output
 *.png
 *.tmp
+
+# Local data cache — regenerable via collect_funding.py / funding_scanner.py.
+# The full funding scan grows this past GitHub's 100MB file limit, so it is a
+# local cache only. funding_scan.csv (the scan RESULTS) stays tracked.
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Scan / server logs
+*.log
