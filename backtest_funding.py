@@ -35,21 +35,24 @@ def intervals_per_year(median_gap_hours):
     return (365.0 * 24.0) / median_gap_hours
 
 
-def roundtrip_cost_frac(exchange):
+def roundtrip_cost_frac(exchange, slip_bps=None):
     """
     One full in-and-out of a delta-neutral hedge:
       entry  = buy spot  (taker+slip) + short perp (taker+slip)
       exit   = sell spot (taker+slip) + cover perp (taker+slip)
     => 2x spot taker + 2x perp taker + 4 leg-crosses of slippage.
+    `slip_bps` overrides the config default (used by the slippage sweep).
     """
     f = fee(exchange)
-    slip = SLIPPAGE_BPS_PER_LEG / 1e4
+    slip = (SLIPPAGE_BPS_PER_LEG if slip_bps is None else slip_bps) / 1e4
     return 2 * f["spot_taker"] + 2 * f["perp_taker"] + 4 * slip
 
 
-def rebalance_drag_frac(days_held):
-    """Delta-rebalancing taker drag accrued over the holding period."""
-    return (REBALANCE_DRAG_BPS_PER_DAY / 1e4) * days_held
+def rebalance_drag_frac(days_held, drag_bps_per_day=None):
+    """Delta-rebalancing taker drag accrued over the holding period.
+    `drag_bps_per_day` overrides the config default (used by the drag sweep)."""
+    drag = REBALANCE_DRAG_BPS_PER_DAY if drag_bps_per_day is None else drag_bps_per_day
+    return (drag / 1e4) * days_held
 
 
 def borrow_cost_frac(days_held):
@@ -64,74 +67,79 @@ def borrow_cost_frac(days_held):
 # The spot long cancels perp price PnL (delta-neutral), so PnL == funding flow.
 # ============================================================================
 
-def harvest_always_on(rates, exchange, days_held):
+def harvest_always_on(rates, exchange, days_held, slip_bps=None, drag_bps_per_day=None):
     """
-    Hold the hedge for the whole window. Returns a dict of PnL components,
-    all as fractions of notional, plus the cumulative net-PnL path for risk.
+    Hold the hedge for the whole window. Returns a dict of PnL components, all as
+    fractions of notional, plus the funding+drag equity path for drawdown.
+
+    `gross` is the period funding total (sign-aware sum); it feeds `net`. For
+    cross-venue comparison use an APR built from mean(rates) x intervals/yr, not
+    this sum, because funding cadences differ.
     """
     rates = np.asarray(rates, dtype=float)
     n = len(rates)
-    gross = float(rates.sum())                       # funding collected (net of sign)
-    rt = roundtrip_cost_frac(exchange)               # one entry + one exit
-    rebal = rebalance_drag_frac(days_held)
+    gross = float(rates.sum())                                  # period funding (sign-aware)
+    rt = roundtrip_cost_frac(exchange, slip_bps)                # one entry + one exit
+    rebal = rebalance_drag_frac(days_held, drag_bps_per_day)
     borrow = borrow_cost_frac(days_held)
     net = gross - rt - rebal - borrow
 
-    # Cumulative net-PnL path: pay half the round trip at entry, accrue funding
-    # minus per-interval rebal drag, pay the other half at exit. Used for DD.
+    # Equity path = funding minus per-interval rebalance drag, ONE node per
+    # interval. Round-trip entry/exit cost is deliberately NOT in the path:
+    # paying to enter is not a drawdown. A dip here means funding actually bled.
     per_interval_rebal = rebal / n if n else 0.0
-    path = np.empty(n + 1)
-    path[0] = -rt / 2.0
-    for i, r in enumerate(rates):
-        path[i + 1] = path[i] + r - per_interval_rebal
-    path[-1] -= rt / 2.0
+    path = np.cumsum(rates - per_interval_rebal)
     return {
         "gross": gross, "roundtrip": rt, "rebal": rebal, "borrow": borrow,
         "net": net, "path": path, "n": n,
     }
 
 
-def harvest_conditional(rates, exchange, days_held, trailing=COND_TRAILING_INTERVALS):
+def harvest_conditional(rates, exchange, days_held, trailing=COND_TRAILING_INTERVALS,
+                        slip_bps=None, drag_bps_per_day=None):
     """
     Only hold while trailing-mean funding is positive; sit flat otherwise.
     Pays a fresh round trip each time we re-enter (this is what kills naive
     'just turn it off' strategies — flip costs eat the saved negative funding).
+
+    The entry signal uses STRICTLY PRIOR bars rates[i-trailing:i]; on the first
+    bar the window is empty so the cold start is FLAT (no peeking at the current
+    bar's funding to decide whether to collect that same bar). The equity path
+    is funding+drag only, one node per interval; round-trip entry/exit cost is
+    accumulated separately and subtracted into `net`, never into the path.
     """
     rates = np.asarray(rates, dtype=float)
     n = len(rates)
-    rt = roundtrip_cost_frac(exchange)
-    per_day_rebal = REBALANCE_DRAG_BPS_PER_DAY / 1e4
+    rt = roundtrip_cost_frac(exchange, slip_bps)
+    drag = REBALANCE_DRAG_BPS_PER_DAY if drag_bps_per_day is None else drag_bps_per_day
     gap_days = days_held / n if n else 0.0
+    per_interval_rebal = (drag / 1e4) * gap_days
 
     in_pos = False
-    gross = 0.0
-    cost = 0.0
+    gross = 0.0                       # funding collected while in position
+    roundtrip_cost = 0.0              # entry/exit costs only (kept off the path)
     entries = 0
-    path = [0.0]
+    equity = 0.0                      # funding+drag equity, in NOTIONAL fractions
+    path = np.empty(n)
     for i, r in enumerate(rates):
-        window = rates[max(0, i - trailing):i]
-        signal = window.mean() > 0 if len(window) else r > 0
+        window = rates[max(0, i - trailing):i]          # strictly prior bars
+        signal = bool(window.mean() > 0) if window.size else False  # cold start flat
         if signal and not in_pos:
             in_pos = True
             entries += 1
-            cost += rt / 2.0
-            path.append(path[-1] - rt / 2.0)
+            roundtrip_cost += rt / 2.0                   # entry cost (NOT in path)
         elif not signal and in_pos:
             in_pos = False
-            cost += rt / 2.0
-            path.append(path[-1] - rt / 2.0)
+            roundtrip_cost += rt / 2.0                   # exit cost (NOT in path)
         if in_pos:
             gross += r
-            step_cost = per_day_rebal * gap_days
-            cost += step_cost
-            path.append(path[-1] + r - step_cost)
-        else:
-            path.append(path[-1])
-    if in_pos:                       # close at end
-        cost += rt / 2.0
-        path.append(path[-1] - rt / 2.0)
-    return {"gross": gross, "cost": cost, "net": gross - cost,
-            "entries": entries, "path": np.asarray(path), "n": n}
+            equity += r - per_interval_rebal             # funding+drag only
+        path[i] = equity                                 # exactly one node / interval
+    if in_pos:                                           # close at end
+        roundtrip_cost += rt / 2.0
+    net = float(equity) - roundtrip_cost
+    return {"gross": gross, "roundtrip": roundtrip_cost, "net": net,
+            "entries": entries, "path": path, "n": n}
 
 
 def max_drawdown(path):
@@ -228,5 +236,114 @@ def main():
     conn.close()
 
 
+def kraken_verdict_report():
+    """
+    Stress the funding harvest on the REAL Kraken Futures BTC perp series (the
+    only ~365d window in the DB), sweeping the frictions that actually decide
+    the verdict. Hourly cadence => mean(rate) x intervals/yr is the only honest
+    APR; the raw sum is shown but never used for comparison.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    ex, sym = "krakenfutures", "BTC/USDT:USDT"
+    ts, rates = load_series(conn, ex, sym)
+    conn.close()
+    rates = np.asarray(rates, dtype=float)
+    if rates.size < 100:
+        print("\nKraken 365d BTC series not found in DB — run collect_funding.py first.")
+        return
+
+    gap_h = float(np.median(np.diff(ts)) / 3_600_000)
+    days = (ts[-1] - ts[0]) / MS_DAY
+    ipy = intervals_per_year(gap_h)
+    gross_apr = float(rates.mean()) * ipy
+    negstrk = longest_negative_streak(rates)
+    negstrk_days = negstrk * gap_h / 24.0
+
+    SLIPS = [1, 3, 5]            # bps per leg-cross
+    DRAGS = [0.5, 1.0, 1.5]      # rebalance bps per day
+    CAPS = [1.2, 1.6, 2.0]       # capital multiple (1.2 levered/liq-risk .. 2.0 unlevered-safe)
+    base_drag = REBALANCE_DRAG_BPS_PER_DAY
+
+    print("\n" + "=" * 78)
+    print("  VERDICT HARNESS — real Kraken Futures BTC perp (crypto_poc.db)")
+    print("=" * 78)
+    print(f"  series : {ex} {sym}   n={rates.size} intervals   span={days:.0f}d   "
+          f"cadence={gap_h:.2f}h")
+    print(f"  gross APR (mean x intervals/yr) : {gross_apr * 100:+.2f}%   "
+          f"[raw window sum = {rates.sum() * 100:+.2f}%, NOT used cross-venue]")
+    print(f"  longest negative funding streak : {negstrk} intervals "
+          f"({negstrk_days:.1f} days)")
+
+    # Always-on NET APR on NOTIONAL: slippage x rebalance-drag
+    print("\n  Always-on NET APR on NOTIONAL   (rows=slippage bp/leg, cols=rebalance bp/day)")
+    print("            " + "".join(f"{d:>9.1f}bp/d" for d in DRAGS))
+    for slip in SLIPS:
+        cells = [annualize(harvest_always_on(rates, ex, days, slip_bps=slip,
+                                             drag_bps_per_day=drag)["net"], days) * 100
+                 for drag in DRAGS]
+        print(f"    {slip:>2d}bp/leg " + "".join(f"{c:>11.2f}%" for c in cells))
+
+    # Always-on NET APR on CAPITAL: slippage x capital-multiple (at base drag), + path DD
+    print(f"\n  Always-on NET APR on CAPITAL   (rows=slippage bp/leg, cols=capital_multiple; "
+          f"rebalance drag={base_drag}bp/day)")
+    print("            " + "".join(f"{c:>9.1f}x  " for c in CAPS) + "    maxDD(fund+drag)")
+    cap_tbl = {}
+    for slip in SLIPS:
+        res = harvest_always_on(rates, ex, days, slip_bps=slip, drag_bps_per_day=base_drag)
+        notion = annualize(res["net"], days)
+        cells = []
+        for cap in CAPS:
+            cap_tbl[(slip, cap)] = notion / cap * 100
+            cells.append(notion / cap * 100)
+        dd = max_drawdown(res["path"]) * 100
+        print(f"    {slip:>2d}bp/leg " + "".join(f"{c:>10.2f}%" for c in cells)
+              + f"      {dd:>8.2f}%")
+
+    # Conditional strategy (base slip/drag)
+    cond = harvest_conditional(rates, ex, days)
+    cond_apr = annualize(cond["net"], days) * 100
+    cond_dd = max_drawdown(cond["path"]) * 100
+    print(f"\n  Conditional (hold only when trailing funding>0, base slip/drag): "
+          f"net APR(notional)={cond_apr:+.2f}%  entries={cond['entries']}  "
+          f"maxDD={cond_dd:+.2f}%")
+
+    # VERDICT — funding harvest is REAL only if the unlevered-safe (2.0x) capital
+    # return stays positive at slippage >= 3 bps/leg. We test that across the FULL
+    # rebalance-drag sweep, not just the rosiest drag: a "pass" that survives only
+    # at 0.5bp/day drag and dies at realistic drag is not a robust edge — it's
+    # compensation for the short-perp tail risk.
+    def cap2(slip, drag):
+        notion = annualize(harvest_always_on(rates, ex, days, slip_bps=slip,
+                                             drag_bps_per_day=drag)["net"], days)
+        return notion / 2.0 * 100.0
+
+    print("\n" + "-" * 78)
+    print("  TEST: 2.0x (unlevered-safe) capital net APR at slip>=3bp/leg, "
+          "across rebalance drag")
+    print("          " + "".join(f"{d:>9.1f}bp/d" for d in DRAGS))
+    grid = {}
+    for slip in (3, 5):
+        row = [cap2(slip, d) for d in DRAGS]
+        for d, v in zip(DRAGS, row):
+            grid[(slip, d)] = v
+        print(f"   slip={slip}bp " + "".join(f"{v:>11.2f}%" for v in row))
+
+    all_pos = all(v > 0 for v in grid.values())
+    rosy_only = (not all_pos) and grid[(3, base_drag)] > 0 and grid[(5, base_drag)] > 0
+    if all_pos:
+        print("  VERDICT: PASS — robust capturable edge. Net positive on unlevered-safe")
+        print("           capital at slip>=3bp across every rebalance-drag assumption.")
+    elif rosy_only:
+        print("  VERDICT: FAIL — positive ONLY at the most optimistic drag (0.5bp/day);")
+        print("           any realistic rebalancing cost (>=1.0bp/day) turns it negative.")
+        print("           A sub-1%/yr edge this fragile is compensation for short-perp")
+        print("           tail risk, NOT a real edge.")
+    else:
+        print("  VERDICT: FAIL — net <=0 on unlevered-safe capital at slip>=3bp/leg.")
+        print("           This is compensation for short-perp tail risk, NOT an edge.")
+    print("-" * 78)
+
+
 if __name__ == "__main__":
     main()
+    kraken_verdict_report()
