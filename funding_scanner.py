@@ -26,17 +26,21 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import ccxt
 import numpy as np
 
-from config import DB_PATH
+from config import DB_PATH, make_exchange
 from store import SCHEMA, upsert_funding
 
 MS_DAY = 86_400_000
 
-# Reachable perp venues to scan. kucoinfutures is intentionally skipped — its
-# public history caps at ~33d, too short to judge structural richness.
+# Direct (US-reachable) perp venues. kucoinfutures is intentionally skipped —
+# its public history caps at ~33d, too short to judge structural richness.
 SCAN_VENUES = ["okx", "krakenfutures", "bitget", "gate"]
+
+# Geo-blocked venues reachable only via the residential proxy (the two biggest
+# perp/funding venues). Opt-in with --proxy because routing ~900 perps through a
+# metered residential proxy is slow and burns bandwidth.
+PROXY_SCAN_VENUES = ["binanceusdm", "bybit"]
 
 # Per-venue history window caps (endpoint refuses longer). gate rejects >180d.
 MAX_DAYS = {"gate": 170}
@@ -57,9 +61,10 @@ _write_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 def load_exchange(name):
-    ex = getattr(ccxt, name)({"enableRateLimit": True, "timeout": 25000,
-                              "options": {"defaultType": "swap"}})
-    for _ in range(3):
+    # Rebuild per attempt so the residential proxy hands out a fresh IP on retry
+    # (proxy venues are flaky; direct venues just retry transient errors).
+    for _ in range(4):
+        ex = make_exchange(name, default_type="swap", timeout=30000)
         try:
             ex.load_markets()
             return ex
@@ -86,10 +91,13 @@ def fetch_funding(ex, name, market, target_days):
     since = ex.milliseconds() - days * MS_DAY
     seen, last, stalls = {}, None, 0
     while True:
-        try:
-            batch = ex.fetch_funding_rate_history(market, since=since, limit=1000)
-        except Exception:
-            break
+        batch = None
+        for _ in range(3):                       # retry transient/proxy errors
+            try:
+                batch = ex.fetch_funding_rate_history(market, since=since, limit=1000)
+                break
+            except Exception:
+                time.sleep(1)
         if not batch:
             break
         for r in batch:
@@ -166,7 +174,7 @@ def compute_metrics(conn):
         "ORDER BY exchange, market").fetchall()
     out = []
     for ex, market in pairs:
-        if ex not in SCAN_VENUES:            # e.g. skip cached kucoinfutures rows
+        if ex == "kucoinfutures":            # skip cached rows from the too-short venue
             continue
         data = conn.execute(
             "SELECT ts, funding_rate FROM funding_history "
@@ -223,15 +231,20 @@ def main():
     ap.add_argument("--refresh", action="store_true", help="refetch even if cached")
     ap.add_argument("--top", type=int, default=60, help="table rows to print")
     ap.add_argument("--no-collect", action="store_true", help="metrics only, skip fetch")
+    ap.add_argument("--proxy", action="store_true",
+                    help="also scan geo-blocked venues (binanceusdm, bybit) via proxy")
     args = ap.parse_args()
 
+    venues = SCAN_VENUES + (PROXY_SCAN_VENUES if args.proxy else [])
+
     if not args.no_collect:
-        print(f"Scanning funding across {SCAN_VENUES} (target {args.days}d, "
-              f"reuse cached={'no' if args.refresh else 'yes'})...")
+        print(f"Scanning funding across {venues} (target {args.days}d, "
+              f"reuse cached={'no' if args.refresh else 'yes'}"
+              f"{', proxy ON for '+str(PROXY_SCAN_VENUES) if args.proxy else ''})...")
         t0 = time.time()
-        with ThreadPoolExecutor(max_workers=len(SCAN_VENUES)) as pool:
+        with ThreadPoolExecutor(max_workers=len(venues)) as pool:
             futs = [pool.submit(scan_venue, v, args.days, args.refresh, args.limit, True)
-                    for v in SCAN_VENUES]
+                    for v in venues]
             for f in futs:
                 r = f.result()
                 print(f"  done {r['venue']:<14} status={r['status']} "
