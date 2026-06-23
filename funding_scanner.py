@@ -21,6 +21,7 @@ Run:  .venv/bin/python funding_scanner.py [--days 365] [--limit N] [--refresh]
 """
 import argparse
 import csv
+import datetime as dt
 import sqlite3
 import threading
 import time
@@ -224,6 +225,74 @@ def header():
     print("  " + "-" * 87)
 
 
+# --- liquidity (24h quote volume from ccxt tickers) ------------------------
+
+def fetch_liquidity(symbols_by_venue):
+    """{(venue, symbol): 24h_quote_volume_usd}. One fetch_tickers call per venue
+    (proxy-aware via make_exchange). Falls back to base_vol*last, then None."""
+    out = {}
+    for venue, syms in symbols_by_venue.items():
+        try:
+            ex = make_exchange(venue, default_type="swap", timeout=30000)
+            ex.load_markets()
+            tickers = ex.fetch_tickers(syms)
+        except Exception:
+            tickers = {}
+        for s in syms:
+            t = tickers.get(s, {}) or {}
+            qv = t.get("quoteVolume")
+            if qv is None and t.get("baseVolume") and t.get("last"):
+                qv = t["baseVolume"] * t["last"]
+            out[(venue, s)] = qv
+    return out
+
+
+def fmt_usd(qv):
+    if qv is None:
+        return "n/a"
+    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if qv >= div:
+            return f"${qv/div:.1f}{unit}"
+    return f"${qv:.0f}"
+
+
+def liq_tier(qv):
+    """Crude tier — the friction model is fantasy below ~$10M/24h."""
+    if qv is None:
+        return "?"
+    if qv >= 100e6:
+        return "MAJOR"
+    if qv >= 10e6:
+        return "mid"
+    return "THIN"
+
+
+# --- monthly funding bucketing (stationary vs regime-driven) ---------------
+
+def monthly_buckets(ts, rates, ipy):
+    """Per calendar month: (YYYY-MM, gross_apr, pct_positive, n_intervals)."""
+    by_month = {}
+    for t, r in zip(ts, rates):
+        m = dt.datetime.fromtimestamp(t / 1000, dt.timezone.utc).strftime("%Y-%m")
+        by_month.setdefault(m, []).append(r)
+    out = []
+    for m in sorted(by_month):
+        a = np.asarray(by_month[m], dtype=float)
+        out.append((m, float(a.mean()) * ipy, float((a > 0).mean()), len(a)))
+    return out
+
+
+def stationarity(buckets, min_n=5):
+    """STATIONARY = rich every month (real edge); REGIME = concentrated in hot
+    months (directional premium). Ignores stub months with < min_n intervals."""
+    full = [b for b in buckets if b[3] >= min_n]
+    if len(full) < 2:
+        return "n/a"
+    if min(b[1] for b in full) > 0 and min(b[2] for b in full) > 0.5:
+        return "STATIONARY"
+    return "REGIME"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=365, help="target history depth")
@@ -277,17 +346,54 @@ def main():
     short = [r for r in rows if r["gross_apr"] > MIN_GROSS_APR
              and r["pct_positive"] > MIN_PCT_POS
              and r["days_of_history"] > MIN_DAYS]
-    print("\n" + "=" * 91)
+    print("\n" + "=" * 100)
     print(f"  SHORTLIST — gross_apr>{MIN_GROSS_APR*100:.0f}%  "
           f"pct_positive>{MIN_PCT_POS:.2f}  days>{MIN_DAYS}   "
           f"({len(short)} candidates worth a friction sweep)")
-    print("=" * 91)
-    if short:
-        header()
-        for r in short:
-            print_row(r)
-    else:
+    print("=" * 100)
+    if not short:
         print("  none — no perp is simultaneously rich, persistent, and deep enough.")
+        return
+
+    # 24h quote volume per shortlisted name — friction model is fantasy on thin alts.
+    by_venue = {}
+    for r in short:
+        by_venue.setdefault(r["venue"], []).append(r["symbol"])
+    liq = fetch_liquidity(by_venue)
+
+    print(f"  {'venue':<14}{'symbol':<22}{'gross_apr':>10}{'pct_pos':>8}"
+          f"{'neg_streak':>12}{'worst_7d':>12}{'days':>7}{'liq_24h':>10}{'tier':>7}")
+    print("  " + "-" * 98)
+    for r in short:
+        qv = liq.get((r["venue"], r["symbol"]))
+        print(f"  {r['venue']:<14}{r['symbol']:<22}{r['gross_apr']*100:>9.1f}%"
+              f"{r['pct_positive']*100:>7.1f}%{r['longest_neg_streak_days']:>11.1f}d"
+              f"{r['worst_7d_cumulative']*100:>11.2f}%{r['days_of_history']:>6.0f}d"
+              f"{fmt_usd(qv):>10}{liq_tier(qv):>7}")
+
+    # Monthly breakdown: is the richness STATIONARY (rich every month -> real edge)
+    # or REGIME-driven (a few hot months during a rally -> directional premium that
+    # inverts next regime)?
+    print("\n" + "=" * 100)
+    print("  MONTHLY FUNDING BREAKDOWN per shortlisted symbol  (month: gross_apr / pct_pos)")
+    print("  STATIONARY = rich every month;  REGIME = concentrated in hot months")
+    print("=" * 100)
+    mconn = open_conn()
+    for r in short:
+        data = mconn.execute(
+            "SELECT ts, funding_rate FROM funding_history "
+            "WHERE exchange=? AND market=? ORDER BY ts", (r["venue"], r["symbol"])).fetchall()
+        ts = np.array([d[0] for d in data], dtype=float)
+        rates = np.array([d[1] for d in data], dtype=float)
+        ipy = (365.0 * 24.0) / float(np.median(np.diff(ts)) / 3_600_000)
+        b = monthly_buckets(ts, rates, ipy)
+        qv = liq.get((r["venue"], r["symbol"]))
+        print(f"\n  {r['venue']} {r['symbol']}  [{fmt_usd(qv)} {liq_tier(qv)}]  "
+              f"overall {r['gross_apr']*100:+.0f}%  ->  {stationarity(b)}")
+        cells = [f"{m}:{apr*100:+.0f}%/{pos*100:.0f}%" for m, apr, pos, _ in b]
+        for i in range(0, len(cells), 4):
+            print("      " + "   ".join(cells[i:i + 4]))
+    mconn.close()
 
 
 if __name__ == "__main__":
