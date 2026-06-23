@@ -1,0 +1,31 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Secrets / credentials / API keys  (POC is keyless, but never commit these)
+.env
+.env.*
+*.pem
+*.key
+*_key
+*_secret
+*.secret
+*.credentials
+credentials.json
+secrets.json
+api_keys.json
+keys.json
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Plots / scratch output
+*.png
+*.tmp
