@@ -71,3 +71,46 @@ BORROW_APR = 0.0
 COND_TRAILING_INTERVALS = 3
 
 DB_PATH = "crypto_poc.db"
+
+# ----------------------------------------------------------------------------
+# Proxy — residential HTTP proxy used ONLY where useful: venues that are geo /
+# Cloudflare blocked from a US IP. Loaded at runtime from PROXY_URL env or a
+# gitignored proxies.txt (NEVER committed — public repo). Exit observed: SG.
+# ----------------------------------------------------------------------------
+import os  # noqa: E402
+
+# Venues unreachable direct from US (451/403) but reachable via the proxy.
+# Everything else stays DIRECT (faster, no metered proxy bandwidth).
+PROXY_VENUES = {"binance", "binanceusdm", "bybit"}
+
+
+def get_proxy():
+    """HTTP proxy URL (or None). PROXY_URL env wins; else first line of proxies.txt."""
+    url = os.environ.get("PROXY_URL", "").strip()
+    if url:
+        return url
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt")
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return line
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def make_exchange(name, default_type="swap", use_proxy=None, timeout=30000):
+    """Build a ccxt exchange, routing through the proxy when the venue needs it.
+    Only `httpsProxy` is set (exchange APIs are HTTPS; setting >1 proxy errors)."""
+    import ccxt
+    ex = getattr(ccxt, name)({"enableRateLimit": True, "timeout": timeout,
+                              "options": {"defaultType": default_type}})
+    if use_proxy is None:
+        use_proxy = name in PROXY_VENUES
+    if use_proxy:
+        p = get_proxy()
+        if p:
+            ex.httpsProxy = p
+    return ex

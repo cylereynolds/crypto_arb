@@ -40,3 +40,7 @@ Thumbs.db
 
 # Scan / server logs
 *.log
+
+# Proxy credentials — NEVER commit (public repo). Loaded at runtime only.
+proxies.txt
+.env
